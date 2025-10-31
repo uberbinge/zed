@@ -9,7 +9,7 @@ use workspace::Workspace;
 
 mod modal;
 
-pub use modal::{Rerun, ShowAttachModal, Spawn, TaskOverrides, TasksModal};
+pub use modal::{Rerun, RerunAndGoToError, ShowAttachModal, Spawn, TaskOverrides, TasksModal};
 
 pub fn init(cx: &mut App) {
     cx.observe_new(
@@ -78,6 +78,112 @@ pub fn init(cx: &mut App) {
                                 window,
                                 cx,
                             );
+                        }
+                    } else {
+                        spawn_task_or_modal(
+                            workspace,
+                            &Spawn::ViaModal {
+                                reveal_target: None,
+                            },
+                            window,
+                            cx,
+                        );
+                    };
+                })
+                .register_action(move |workspace, action: &modal::RerunAndGoToError, window, cx| {
+                    if let Some((task_source_kind, mut last_scheduled_task)) = workspace
+                        .project()
+                        .read(cx)
+                        .task_store()
+                        .read(cx)
+                        .task_inventory()
+                        .and_then(|inventory| {
+                            inventory.read(cx).last_scheduled_task(
+                                action
+                                    .task_id
+                                    .as_ref()
+                                    .map(|id| TaskId(id.clone()))
+                                    .as_ref(),
+                            )
+                        })
+                    {
+                        let workspace_handle = cx.entity().downgrade();
+                        let project = workspace.project().clone();
+
+                        if action.reevaluate_context {
+                            let mut original_task = last_scheduled_task.original_task().clone();
+                            if let Some(allow_concurrent_runs) = action.allow_concurrent_runs {
+                                original_task.allow_concurrent_runs = allow_concurrent_runs;
+                            }
+                            if let Some(use_new_terminal) = action.use_new_terminal {
+                                original_task.use_new_terminal = use_new_terminal;
+                            }
+                            let task_contexts = task_contexts(workspace, window, cx);
+                            cx.spawn_in(window, async move |workspace, cx| {
+                                let task_contexts = task_contexts.await;
+                                let default_context = TaskContext::default();
+                                let active_context = task_contexts.active_context().unwrap_or(&default_context);
+
+                                let task_result = workspace
+                                    .update_in(cx, |workspace, window, cx| {
+                                        workspace.schedule_task_returning_completion(
+                                            task_source_kind,
+                                            &original_task,
+                                            active_context,
+                                            false,
+                                            window,
+                                            cx,
+                                        )
+                                    })
+                                    .ok()?;
+
+                                if let Some(task_result) = task_result {
+                                    if let Some(result) = task_result.await {
+                                        if result.is_err() || result.as_ref().is_ok_and(|status| !status.success()) {
+                                            workspace_handle
+                                                .update(cx, |workspace, cx| {
+                                                    navigate_to_first_diagnostic(workspace, &project, window, cx);
+                                                })
+                                                .ok();
+                                        }
+                                    }
+                                }
+
+                                Some(())
+                            })
+                            .detach()
+                        } else {
+                            let resolved = &mut last_scheduled_task.resolved;
+
+                            if let Some(allow_concurrent_runs) = action.allow_concurrent_runs {
+                                resolved.allow_concurrent_runs = allow_concurrent_runs;
+                            }
+                            if let Some(use_new_terminal) = action.use_new_terminal {
+                                resolved.use_new_terminal = use_new_terminal;
+                            }
+
+                            let task_result = workspace.schedule_resolved_task_returning_completion(
+                                task_source_kind,
+                                last_scheduled_task.clone(),
+                                false,
+                                window,
+                                cx,
+                            );
+
+                            cx.spawn_in(window, async move |workspace, cx| {
+                                if let Some(task_result) = task_result {
+                                    if let Some(result) = task_result.await {
+                                        if result.is_err() || result.as_ref().is_ok_and(|status| !status.success()) {
+                                            workspace_handle
+                                                .update(cx, |workspace, cx| {
+                                                    navigate_to_first_diagnostic(workspace, &project, window, cx);
+                                                })
+                                                .ok();
+                                        }
+                                    }
+                                }
+                            })
+                            .detach();
                         }
                     } else {
                         spawn_task_or_modal(
@@ -385,6 +491,41 @@ fn worktree_context(worktree_abs_path: &Path) -> TaskContext {
         cwd: Some(worktree_abs_path.to_path_buf()),
         task_variables,
         project_env: HashMap::default(),
+    }
+}
+
+fn navigate_to_first_diagnostic(
+    workspace: &mut Workspace,
+    project: &Entity<project::Project>,
+    window: &mut Window,
+    cx: &mut Context<Workspace>,
+) {
+    let first_diagnostic_path = project
+        .read(cx)
+        .diagnostic_summaries(false, cx)
+        .find(|(_, _, summary)| summary.error_count > 0)
+        .map(|(path, _, _)| path);
+
+    if let Some(path) = first_diagnostic_path {
+        let task = workspace.open_path(path, None, true, window, cx);
+        cx.spawn_in(window, async move |workspace, cx| {
+            if let Ok(item) = task.await {
+                workspace
+                    .update(cx, |_, cx| {
+                        if let Some(editor) = item.downcast::<editor::Editor>() {
+                            editor.update(cx, |editor, window, cx| {
+                                editor.go_to_diagnostic(
+                                    &editor::actions::GoToDiagnostic::default(),
+                                    window,
+                                    cx,
+                                );
+                            });
+                        }
+                    })
+                    .ok();
+            }
+        })
+        .detach();
     }
 }
 

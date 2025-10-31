@@ -509,6 +509,44 @@ pub struct Rerun {
     pub task_id: Option<String>,
 }
 
+/// Reruns the last task and jumps to the first error if the task fails.
+#[derive(PartialEq, Clone, Deserialize, JsonSchema, Action)]
+#[action(namespace = task)]
+#[serde(deny_unknown_fields)]
+pub struct RerunAndGoToError {
+    /// Controls whether the task context is reevaluated prior to execution of a task.
+    /// default: true
+    #[serde(default = "rerun_and_go_to_error_default_reevaluate_context")]
+    pub reevaluate_context: bool,
+    /// Overrides `allow_concurrent_runs` property of the task being reran.
+    /// Default: null
+    #[serde(default)]
+    pub allow_concurrent_runs: Option<bool>,
+    /// Overrides `use_new_terminal` property of the task being reran.
+    /// Default: null
+    #[serde(default)]
+    pub use_new_terminal: Option<bool>,
+
+    /// If present, rerun the task with this ID, otherwise rerun the last task.
+    #[serde(skip)]
+    pub task_id: Option<String>,
+}
+
+impl Default for RerunAndGoToError {
+    fn default() -> Self {
+        Self {
+            reevaluate_context: true,
+            allow_concurrent_runs: None,
+            use_new_terminal: None,
+            task_id: None,
+        }
+    }
+}
+
+fn rerun_and_go_to_error_default_reevaluate_context() -> bool {
+    true
+}
+
 pub mod outline {
     use std::sync::OnceLock;
 
