@@ -20,6 +20,49 @@ impl Workspace {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        self.schedule_task_internal(
+            task_source_kind,
+            task_to_resolve,
+            task_cx,
+            omit_history,
+            false,
+            window,
+            cx,
+        );
+    }
+
+    /// Like `schedule_task`, but returns the raw task completion handle
+    /// so the caller can await the exit status.
+    pub fn schedule_task_returning_completion(
+        self: &mut Workspace,
+        task_source_kind: TaskSourceKind,
+        task_to_resolve: &TaskTemplate,
+        task_cx: &TaskContext,
+        omit_history: bool,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Option<Task<Option<Result<ExitStatus>>>> {
+        self.schedule_task_internal(
+            task_source_kind,
+            task_to_resolve,
+            task_cx,
+            omit_history,
+            true,
+            window,
+            cx,
+        )
+    }
+
+    fn schedule_task_internal(
+        self: &mut Workspace,
+        task_source_kind: TaskSourceKind,
+        task_to_resolve: &TaskTemplate,
+        task_cx: &TaskContext,
+        omit_history: bool,
+        return_completion: bool,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Option<Task<Option<Result<ExitStatus>>>> {
         match self.project.read(cx).remote_connection_state(cx) {
             None | Some(ConnectionState::Connected) => {}
             Some(
@@ -29,20 +72,33 @@ impl Workspace {
                 | ConnectionState::Reconnecting,
             ) => {
                 log::warn!("Cannot schedule tasks when disconnected from a remote host");
-                return;
+                return None;
             }
         }
 
         if let Some(spawn_in_terminal) =
             task_to_resolve.resolve_task(&task_source_kind.to_id_base(), task_cx)
         {
-            self.schedule_resolved_task(
-                task_source_kind,
-                spawn_in_terminal,
-                omit_history,
-                window,
-                cx,
-            );
+            if return_completion {
+                self.schedule_resolved_task_returning_completion(
+                    task_source_kind,
+                    spawn_in_terminal,
+                    omit_history,
+                    window,
+                    cx,
+                )
+            } else {
+                self.schedule_resolved_task(
+                    task_source_kind,
+                    spawn_in_terminal,
+                    omit_history,
+                    window,
+                    cx,
+                );
+                None
+            }
+        } else {
+            None
         }
     }
 
@@ -54,6 +110,45 @@ impl Workspace {
         window: &mut Window,
         cx: &mut Context<Workspace>,
     ) {
+        self.schedule_resolved_task_internal(
+            task_source_kind,
+            resolved_task,
+            omit_history,
+            false,
+            window,
+            cx,
+        );
+    }
+
+    /// Like `schedule_resolved_task`, but returns the raw task completion handle
+    /// so the caller can await the exit status.
+    pub fn schedule_resolved_task_returning_completion(
+        self: &mut Workspace,
+        task_source_kind: TaskSourceKind,
+        resolved_task: ResolvedTask,
+        omit_history: bool,
+        window: &mut Window,
+        cx: &mut Context<Workspace>,
+    ) -> Option<Task<Option<Result<ExitStatus>>>> {
+        self.schedule_resolved_task_internal(
+            task_source_kind,
+            resolved_task,
+            omit_history,
+            true,
+            window,
+            cx,
+        )
+    }
+
+    fn schedule_resolved_task_internal(
+        self: &mut Workspace,
+        task_source_kind: TaskSourceKind,
+        resolved_task: ResolvedTask,
+        omit_history: bool,
+        return_completion: bool,
+        window: &mut Window,
+        cx: &mut Context<Workspace>,
+    ) -> Option<Task<Option<Result<ExitStatus>>>> {
         let spawn_in_terminal = resolved_task.resolved.clone();
         if !omit_history {
             if let Some(debugger_provider) = self.debugger_provider.as_ref() {
@@ -74,28 +169,56 @@ impl Workspace {
         if let Some(terminal_provider) = self.terminal_provider.as_ref() {
             let task_status = terminal_provider.spawn(spawn_in_terminal, window, cx);
 
-            let task = cx.spawn(async |w, cx| {
-                let res = cx.background_spawn(task_status).await;
-                match res {
-                    Some(Ok(status)) => {
-                        if status.success() {
-                            log::debug!("Task spawn succeeded");
-                        } else {
-                            log::debug!("Task spawn failed, code: {:?}", status.code());
+            if return_completion {
+                // Clone the task so we can both monitor it and return it
+                let task_status_clone = task_status.clone();
+                let task = cx.spawn(async |w, cx| {
+                    let res = cx.background_spawn(task_status).await;
+                    match res {
+                        Some(Ok(status)) => {
+                            if status.success() {
+                                log::debug!("Task spawn succeeded");
+                            } else {
+                                log::debug!("Task spawn failed, code: {:?}", status.code());
+                            }
                         }
-                    }
-                    Some(Err(e)) => {
-                        log::error!("Task spawn failed: {e:#}");
-                        _ = w.update(cx, |w, cx| {
-                            let id = NotificationId::unique::<ResolvedTask>();
-                            w.show_toast(Toast::new(id, format!("Task spawn failed: {e}")), cx);
-                        })
-                    }
-                    None => log::debug!("Task spawn got cancelled"),
-                };
-            });
-            self.scheduled_tasks.push(task);
+                        Some(Err(e)) => {
+                            log::error!("Task spawn failed: {e:#}");
+                            _ = w.update(cx, |w, cx| {
+                                let id = NotificationId::unique::<ResolvedTask>();
+                                w.show_toast(Toast::new(id, format!("Task spawn failed: {e}")), cx);
+                            })
+                        }
+                        None => log::debug!("Task spawn got cancelled"),
+                    };
+                });
+                self.scheduled_tasks.push(task);
+                return Some(task_status_clone);
+            } else {
+                let task = cx.spawn(async |w, cx| {
+                    let res = cx.background_spawn(task_status).await;
+                    match res {
+                        Some(Ok(status)) => {
+                            if status.success() {
+                                log::debug!("Task spawn succeeded");
+                            } else {
+                                log::debug!("Task spawn failed, code: {:?}", status.code());
+                            }
+                        }
+                        Some(Err(e)) => {
+                            log::error!("Task spawn failed: {e:#}");
+                            _ = w.update(cx, |w, cx| {
+                                let id = NotificationId::unique::<ResolvedTask>();
+                                w.show_toast(Toast::new(id, format!("Task spawn failed: {e}")), cx);
+                            })
+                        }
+                        None => log::debug!("Task spawn got cancelled"),
+                    };
+                });
+                self.scheduled_tasks.push(task);
+            }
         }
+        None
     }
 
     pub fn start_debug_session(

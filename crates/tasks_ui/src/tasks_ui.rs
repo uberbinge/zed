@@ -9,7 +9,7 @@ use workspace::Workspace;
 
 mod modal;
 
-pub use modal::{Rerun, ShowAttachModal, Spawn, TaskOverrides, TasksModal};
+pub use modal::{Rerun, RerunAndGoToError, ShowAttachModal, Spawn, TaskOverrides, TasksModal};
 
 pub fn init(cx: &mut App) {
     cx.observe_new(
@@ -17,82 +17,244 @@ pub fn init(cx: &mut App) {
             workspace
                 .register_action(spawn_task_or_modal)
                 .register_action(move |workspace, action: &modal::Rerun, window, cx| {
-                    if let Some((task_source_kind, mut last_scheduled_task)) = workspace
-                        .project()
-                        .read(cx)
-                        .task_store()
-                        .read(cx)
-                        .task_inventory()
-                        .and_then(|inventory| {
-                            inventory.read(cx).last_scheduled_task(
-                                action
-                                    .task_id
-                                    .as_ref()
-                                    .map(|id| TaskId(id.clone()))
-                                    .as_ref(),
-                            )
-                        })
-                    {
-                        if action.reevaluate_context {
-                            let mut original_task = last_scheduled_task.original_task().clone();
-                            if let Some(allow_concurrent_runs) = action.allow_concurrent_runs {
-                                original_task.allow_concurrent_runs = allow_concurrent_runs;
-                            }
-                            if let Some(use_new_terminal) = action.use_new_terminal {
-                                original_task.use_new_terminal = use_new_terminal;
-                            }
-                            let task_contexts = task_contexts(workspace, window, cx);
-                            cx.spawn_in(window, async move |workspace, cx| {
-                                let task_contexts = task_contexts.await;
-                                let default_context = TaskContext::default();
-                                workspace
-                                    .update_in(cx, |workspace, window, cx| {
-                                        workspace.schedule_task(
-                                            task_source_kind,
-                                            &original_task,
-                                            task_contexts
-                                                .active_context()
-                                                .unwrap_or(&default_context),
-                                            false,
-                                            window,
-                                            cx,
-                                        )
-                                    })
-                                    .ok()
-                            })
-                            .detach()
-                        } else {
-                            let resolved = &mut last_scheduled_task.resolved;
-
-                            if let Some(allow_concurrent_runs) = action.allow_concurrent_runs {
-                                resolved.allow_concurrent_runs = allow_concurrent_runs;
-                            }
-                            if let Some(use_new_terminal) = action.use_new_terminal {
-                                resolved.use_new_terminal = use_new_terminal;
-                            }
-
-                            workspace.schedule_resolved_task(
-                                task_source_kind,
-                                last_scheduled_task,
-                                false,
-                                window,
-                                cx,
-                            );
-                        }
-                    } else {
-                        spawn_task_or_modal(
-                            workspace,
-                            &Spawn::ViaModal {
-                                reveal_target: None,
-                            },
-                            window,
-                            cx,
-                        );
-                    };
-                });
+                    rerun_task_internal(workspace, action, false, window, cx);
+                })
+                .register_action(
+                    move |workspace, action: &modal::RerunAndGoToError, window, cx| {
+                        rerun_task_internal(workspace, action, true, window, cx);
+                    },
+                );
         },
     )
     .detach();
+}
+
+/// Shared properties between Rerun and RerunAndGoToError actions
+trait RerunAction {
+    fn task_id(&self) -> &Option<String>;
+    fn reevaluate_context(&self) -> bool;
+    fn allow_concurrent_runs(&self) -> Option<bool>;
+    fn use_new_terminal(&self) -> Option<bool>;
+}
+
+impl RerunAction for modal::Rerun {
+    fn task_id(&self) -> &Option<String> {
+        &self.task_id
+    }
+    fn reevaluate_context(&self) -> bool {
+        self.reevaluate_context
+    }
+    fn allow_concurrent_runs(&self) -> Option<bool> {
+        self.allow_concurrent_runs
+    }
+    fn use_new_terminal(&self) -> Option<bool> {
+        self.use_new_terminal
+    }
+}
+
+impl RerunAction for modal::RerunAndGoToError {
+    fn task_id(&self) -> &Option<String> {
+        &self.task_id
+    }
+    fn reevaluate_context(&self) -> bool {
+        self.reevaluate_context
+    }
+    fn allow_concurrent_runs(&self) -> Option<bool> {
+        self.allow_concurrent_runs
+    }
+    fn use_new_terminal(&self) -> Option<bool> {
+        self.use_new_terminal
+    }
+}
+
+/// Internal helper to handle both Rerun and RerunAndGoToError actions.
+/// If `navigate_on_error` is true, will navigate to the first diagnostic on task failure.
+fn rerun_task_internal<A: RerunAction>(
+    workspace: &mut Workspace,
+    action: &A,
+    navigate_on_error: bool,
+    window: &mut Window,
+    cx: &mut Context<Workspace>,
+) {
+    let Some((task_source_kind, mut last_scheduled_task)) = workspace
+        .project()
+        .read(cx)
+        .task_store()
+        .read(cx)
+        .task_inventory()
+        .and_then(|inventory| {
+            inventory.read(cx).last_scheduled_task(
+                action
+                    .task_id()
+                    .as_ref()
+                    .map(|id| TaskId(id.clone()))
+                    .as_ref(),
+            )
+        })
+    else {
+        spawn_task_or_modal(
+            workspace,
+            &Spawn::ViaModal {
+                reveal_target: None,
+            },
+            window,
+            cx,
+        );
+        return;
+    };
+
+    if action.reevaluate_context() {
+        rerun_with_reevaluated_context(
+            workspace,
+            action,
+            task_source_kind,
+            last_scheduled_task,
+            navigate_on_error,
+            window,
+            cx,
+        );
+    } else {
+        rerun_with_existing_context(
+            workspace,
+            action,
+            task_source_kind,
+            &mut last_scheduled_task,
+            navigate_on_error,
+            window,
+            cx,
+        );
+    }
+}
+
+/// Reruns a task with reevaluated context (updates ZED_FILE, ZED_COLUMN, etc.)
+fn rerun_with_reevaluated_context<A: RerunAction>(
+    workspace: &mut Workspace,
+    action: &A,
+    task_source_kind: TaskSourceKind,
+    last_scheduled_task: ResolvedTask,
+    navigate_on_error: bool,
+    window: &mut Window,
+    cx: &mut Context<Workspace>,
+) {
+    let mut original_task = last_scheduled_task.original_task().clone();
+    if let Some(allow_concurrent_runs) = action.allow_concurrent_runs() {
+        original_task.allow_concurrent_runs = allow_concurrent_runs;
+    }
+    if let Some(use_new_terminal) = action.use_new_terminal() {
+        original_task.use_new_terminal = use_new_terminal;
+    }
+
+    let task_contexts = task_contexts(workspace, window, cx);
+    let workspace_handle = cx.entity().downgrade();
+    let project = workspace.project().clone();
+
+    cx.spawn_in(window, async move |workspace, cx| {
+        let task_contexts = task_contexts.await;
+        let default_context = TaskContext::default();
+        let active_context = task_contexts.active_context().unwrap_or(&default_context);
+
+        if navigate_on_error {
+            let task_result = workspace
+                .update_in(cx, |workspace, window, cx| {
+                    workspace.schedule_task_returning_completion(
+                        task_source_kind,
+                        &original_task,
+                        active_context,
+                        false,
+                        window,
+                        cx,
+                    )
+                })
+                .ok()?;
+
+            if let Some(task_result) = task_result {
+                if let Some(result) = task_result.await {
+                    if result.is_err() || result.as_ref().is_ok_and(|status| !status.success()) {
+                        workspace_handle
+                            .update_in(cx, |workspace, window, cx| {
+                                navigate_to_first_diagnostic(workspace, &project, window, cx);
+                            })
+                            .unwrap_or_else(|e| {
+                                log::debug!("Workspace closed before navigation: {e}");
+                            });
+                    }
+                }
+            }
+        } else {
+            workspace
+                .update_in(cx, |workspace, window, cx| {
+                    workspace.schedule_task(
+                        task_source_kind,
+                        &original_task,
+                        active_context,
+                        false,
+                        window,
+                        cx,
+                    )
+                })
+                .ok();
+        }
+
+        Some(())
+    })
+    .detach()
+}
+
+/// Reruns a task with existing context (reuses previous environment variables)
+fn rerun_with_existing_context<A: RerunAction>(
+    workspace: &mut Workspace,
+    action: &A,
+    task_source_kind: TaskSourceKind,
+    last_scheduled_task: &mut ResolvedTask,
+    navigate_on_error: bool,
+    window: &mut Window,
+    cx: &mut Context<Workspace>,
+) {
+    let resolved = &mut last_scheduled_task.resolved;
+
+    if let Some(allow_concurrent_runs) = action.allow_concurrent_runs() {
+        resolved.allow_concurrent_runs = allow_concurrent_runs;
+    }
+    if let Some(use_new_terminal) = action.use_new_terminal() {
+        resolved.use_new_terminal = use_new_terminal;
+    }
+
+    if navigate_on_error {
+        let workspace_handle = cx.entity().downgrade();
+        let project = workspace.project().clone();
+        let task_result = workspace.schedule_resolved_task_returning_completion(
+            task_source_kind,
+            last_scheduled_task.clone(),
+            false,
+            window,
+            cx,
+        );
+
+        cx.spawn_in(window, async move |_workspace, cx| {
+            if let Some(task_result) = task_result {
+                if let Some(result) = task_result.await {
+                    if result.is_err() || result.as_ref().is_ok_and(|status| !status.success()) {
+                        workspace_handle
+                            .update_in(cx, |workspace, window, cx| {
+                                navigate_to_first_diagnostic(workspace, &project, window, cx);
+                            })
+                            .unwrap_or_else(|e| {
+                                log::debug!("Workspace closed before navigation: {e}");
+                            });
+                    }
+                }
+            }
+        })
+        .detach();
+    } else {
+        workspace.schedule_resolved_task(
+            task_source_kind,
+            last_scheduled_task.clone(),
+            false,
+            window,
+            cx,
+        );
+    }
 }
 
 fn spawn_task_or_modal(
@@ -385,6 +547,41 @@ fn worktree_context(worktree_abs_path: &Path) -> TaskContext {
         cwd: Some(worktree_abs_path.to_path_buf()),
         task_variables,
         project_env: HashMap::default(),
+    }
+}
+
+fn navigate_to_first_diagnostic(
+    workspace: &mut Workspace,
+    project: &Entity<project::Project>,
+    window: &mut Window,
+    cx: &mut Context<Workspace>,
+) {
+    let first_diagnostic_path = project
+        .read(cx)
+        .diagnostic_summaries(false, cx)
+        .find(|(_, _, summary)| summary.error_count > 0)
+        .map(|(path, _, _)| path);
+
+    if let Some(path) = first_diagnostic_path {
+        let task = workspace.open_path(path, None, true, window, cx);
+        cx.spawn_in(window, async move |workspace, cx| {
+            if let Ok(item) = task.await {
+                workspace
+                    .update(cx, |_, cx| {
+                        if let Some(editor) = item.downcast::<editor::Editor>() {
+                            editor.update(cx, |editor, window, cx| {
+                                editor.go_to_diagnostic(
+                                    &editor::actions::GoToDiagnostic::default(),
+                                    window,
+                                    cx,
+                                );
+                            });
+                        }
+                    })
+                    .ok();
+            }
+        })
+        .detach();
     }
 }
 
